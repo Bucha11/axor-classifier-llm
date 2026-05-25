@@ -15,7 +15,8 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from axor_core.contracts.anomaly import AnomalyResult, NormalizedIntent
+    from axor_core.contracts.anomaly import AnomalyResult
+    from axor_core.contracts.canonical import CanonicalizedIntent
 
 log = logging.getLogger("axor.llm_verifier")
 
@@ -51,25 +52,26 @@ Focus on behavioral patterns, not content semantics:
 - Normal coding/research patterns = normal"""
 
 
-def _format_window(window: "list[NormalizedIntent]") -> str:
+def _format_window(window: "list[CanonicalizedIntent]") -> str:
     lines = []
     for i, intent in enumerate(window, 1):
         flags = []
-        if intent.reads_secret_like_data:
+        if intent.reads_secret:
             flags.append("reads_secret")
-        if intent.writes_outside_workdir:
-            flags.append("writes_outside_workdir")
-        if intent.executes_generated_code:
-            flags.append("executes_generated_code")
+        if intent.writes_outside:
+            flags.append("writes_outside")
+        if intent.executes_generated:
+            flags.append("executes_generated")
         if intent.after_external_read:
             flags.append("after_external_read")
         if intent.after_secret_access:
             flags.append("after_secret_access")
         flag_str = f" [{', '.join(flags)}]" if flags else ""
         lines.append(
-            f"{i}. tool={intent.tool} op={intent.operation} "
-            f"target={intent.target_kind} dest={intent.destination_kind} "
-            f"prov={intent.provenance} flow={intent.data_flow}{flag_str}"
+            f"{i}. cat={intent.tool_category.value} op={intent.operation_class.value} "
+            f"path={intent.path_class.value}[depth={intent.path_depth},ext={intent.path_extension}] "
+            f"export={intent.export_class.value} flow={intent.data_flow} "
+            f"taint={intent.taint_state_summary}{flag_str}"
         )
     return "\n".join(lines)
 
@@ -110,7 +112,7 @@ class LLMAnomalyVerifier:
 
     async def verify(
         self,
-        window: "list[NormalizedIntent]",
+        window: "list[CanonicalizedIntent]",
         task_signal_hint: str = "",
         policy_name: str = "",
     ) -> "AnomalyResult":
@@ -125,12 +127,12 @@ class LLMAnomalyVerifier:
             messages=[{"role": "user", "content": user_content}],
         )
 
-        text = response.content[0].text.strip()
+        text = _extract_text_response(response)
         return _parse_response(text)
 
 
 def _build_user_message(
-    window: "list[NormalizedIntent]",
+    window: "list[CanonicalizedIntent]",
     task_signal_hint: str,
     policy_name: str,
 ) -> str:
@@ -144,6 +146,15 @@ def _build_user_message(
     return "\n".join(parts)
 
 
+def _extract_text_response(response: object) -> str:
+    content = getattr(response, "content", None) or []
+    for block in content:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
+
+
 def _parse_response(text: str) -> "AnomalyResult":
     from axor_core.contracts.anomaly import AnomalyClass, AnomalyResult
 
@@ -154,7 +165,7 @@ def _parse_response(text: str) -> "AnomalyResult":
 
     try:
         data = json.loads(text)
-        score = float(data.get("score", 0.5))
+        score = min(1.0, max(0.0, float(data.get("score", 0.5))))
         cls_str = str(data.get("class", "suspicious")).lower()
         reasons = tuple(str(r) for r in data.get("reasons", []))
         cls = AnomalyClass(cls_str)

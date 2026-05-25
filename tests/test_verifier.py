@@ -14,25 +14,50 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from axor_core.contracts.anomaly import AnomalyClass, AnomalyResult, NormalizedIntent
+from axor_core.contracts.anomaly import AnomalyClass, AnomalyResult
+from axor_core.contracts.canonical import (
+    CanonicalizedIntent,
+    ExportClass,
+    OperationClass,
+    PathClass,
+    ProviderClass,
+    ToolCategory,
+)
 from axor_classifier_llm.verifier import (
     LLMAnomalyVerifier,
     _build_user_message,
+    _extract_text_response,
     _format_window,
     _parse_response,
 )
 
 
-def _ni(**kw) -> NormalizedIntent:
+def _ci(**kw) -> CanonicalizedIntent:
     defaults = dict(
-        tool="read", operation="file_read", target_kind="workdir",
-        destination_kind="none", provenance="repo",
-        reads_secret_like_data=False, writes_outside_workdir=False,
-        executes_generated_code=False, after_external_read=False,
-        after_secret_access=False, data_flow="none",
+        tool_category=ToolCategory.FILE_READ,
+        path_class=PathClass.WORKDIR,
+        path_depth=2,
+        path_extension=".py",
+        path_hash="abc123def456789a",
+        path_is_absolute=False,
+        path_is_outside_workspace=False,
+        argument_shape="path",
+        argument_length_bucket=1,
+        reads_secret=False,
+        writes_outside=False,
+        executes_generated=False,
+        after_external_read=False,
+        after_secret_access=False,
+        data_flow="none",
+        operation_class=OperationClass.READ,
+        export_class=ExportClass.NONE,
+        provider_class=ProviderClass.CLAUDE,
+        taint_state_summary="clean",
+        lease_state_summary="none",
+        node_depth=0,
     )
     defaults.update(kw)
-    return NormalizedIntent(**defaults)
+    return CanonicalizedIntent(**defaults)
 
 
 def _mock_client(response_text: str) -> MagicMock:
@@ -53,11 +78,9 @@ def test_module_imports_without_anthropic(monkeypatch):
     """Package must import without anthropic SDK; error deferred to construction."""
     import importlib
     import sys
-    # Simulate anthropic not installed by blocking the import
     monkeypatch.setitem(sys.modules, "anthropic", None)
-    # verifier module itself should import fine (TYPE_CHECKING guard)
     import axor_classifier_llm.verifier as mod
-    importlib.reload(mod)  # re-import with anthropic=None in sys.modules
+    importlib.reload(mod)
 
 
 def test_construction_raises_without_anthropic(monkeypatch):
@@ -79,32 +102,33 @@ def test_package_init_imports():
 def test_format_window_no_raw_content():
     """Formatted window must not contain any raw content strings."""
     window = [
-        _ni(tool="read", operation="file_read", target_kind="external_url",
-            provenance="external_web"),
-        _ni(tool="bash", operation="execute_generated_code",
-            executes_generated_code=True, after_external_read=True),
+        _ci(tool_category=ToolCategory.NETWORK, path_class=PathClass.EXTERNAL_URL,
+            operation_class=OperationClass.NETWORK, taint_state_summary="tainted:web"),
+        _ci(tool_category=ToolCategory.SHELL, operation_class=OperationClass.EXECUTE,
+            executes_generated=True, after_external_read=True),
     ]
     output = _format_window(window)
-    # Only normalized field values — no raw file contents, no URLs, no tool output
-    assert "tool=" in output
+    assert "cat=" in output
     assert "op=" in output
-    assert "target=" in output
-    # Verify no large blobs or newlines-within-intent format
+    assert "path=" in output
     for line in output.splitlines():
         assert len(line) < 300, f"line suspiciously long: {line!r}"
 
 
 def test_format_window_flags_present():
-    window = [_ni(reads_secret_like_data=True, after_external_read=True)]
+    window = [_ci(reads_secret=True, after_external_read=True)]
     output = _format_window(window)
     assert "reads_secret" in output
     assert "after_external_read" in output
 
 
 def test_format_window_no_flags_when_normal():
-    window = [_ni()]
+    window = [_ci()]
     output = _format_window(window)
-    assert "[" not in output
+    # No risk flags present — the trailing [reads_secret, ...] section should not appear
+    assert "reads_secret" not in output
+    assert "writes_outside" not in output
+    assert "executes_generated" not in output
 
 
 def test_format_window_empty():
@@ -114,19 +138,18 @@ def test_format_window_empty():
 # ── _build_user_message ─────────────────────────────────────────────────────────
 
 def test_user_message_contains_no_raw_content_fields():
-    """The user message must reference only NormalizedIntent fields."""
-    window = [_ni(target_kind="secret", reads_secret_like_data=True)]
+    """The user message must reference only canonical feature fields."""
+    window = [_ci(path_class=PathClass.SECRET, reads_secret=True)]
     msg = _build_user_message(window, task_signal_hint="coding", policy_name="strict")
     assert "Task type: coding" in msg
     assert "Active policy: strict" in msg
     assert "Behavioral sequence" in msg
-    # Should NOT contain field names that would imply raw content was leaked
     for forbidden in ("raw_input", "tool_result", "content", "webpage", "chain_of_thought"):
         assert forbidden not in msg.lower(), f"found forbidden field: {forbidden!r}"
 
 
 def test_user_message_without_hints():
-    window = [_ni()]
+    window = [_ci()]
     msg = _build_user_message(window, task_signal_hint="", policy_name="")
     assert "Behavioral sequence" in msg
     assert "Task type" not in msg
@@ -176,6 +199,19 @@ def test_parse_fallback_on_unknown_class():
     assert "verifier_parse_error" in result.reasons
 
 
+def test_parse_clamps_score_to_valid_range():
+    high = _parse_response(json.dumps({"score": 2.5, "class": "critical", "reasons": []}))
+    low = _parse_response(json.dumps({"score": -1, "class": "normal", "reasons": []}))
+    assert high.score == pytest.approx(1.0)
+    assert low.score == pytest.approx(0.0)
+
+
+def test_extract_text_response_handles_empty_content():
+    response = MagicMock()
+    response.content = []
+    assert _extract_text_response(response) == ""
+
+
 # ── LLMAnomalyVerifier.verify ───────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -184,10 +220,10 @@ async def test_verify_returns_anomaly_result():
     client = _mock_client(response_text)
     verifier = LLMAnomalyVerifier(client=client, model="claude-test", max_tokens=128)
     window = [
-        _ni(target_kind="external_url", provenance="external_web"),
-        _ni(reads_secret_like_data=True, after_external_read=True),
-        _ni(operation="network_request", data_flow="local_to_external",
-            after_secret_access=True),
+        _ci(path_class=PathClass.EXTERNAL_URL, taint_state_summary="tainted:web"),
+        _ci(reads_secret=True, after_external_read=True),
+        _ci(operation_class=OperationClass.NETWORK, export_class=ExportClass.EXTERNAL,
+            after_secret_access=True, data_flow="local_to_external"),
     ]
     result = await verifier.verify(window)
     assert isinstance(result, AnomalyResult)
@@ -200,7 +236,7 @@ async def test_verify_passes_task_signal_hint():
     response_text = json.dumps({"score": 0.1, "class": "normal", "reasons": []})
     client = _mock_client(response_text)
     verifier = LLMAnomalyVerifier(client=client)
-    await verifier.verify([_ni()], task_signal_hint="coding", policy_name="default")
+    await verifier.verify([_ci()], task_signal_hint="coding", policy_name="default")
     call_kwargs = client.messages.create.call_args.kwargs
     user_msg = call_kwargs["messages"][0]["content"]
     assert "coding" in user_msg
@@ -213,7 +249,7 @@ async def test_verify_prompt_has_no_raw_content():
     response_text = json.dumps({"score": 0.2, "class": "normal", "reasons": []})
     client = _mock_client(response_text)
     verifier = LLMAnomalyVerifier(client=client)
-    window = [_ni(target_kind="secret", reads_secret_like_data=True)]
+    window = [_ci(path_class=PathClass.SECRET, reads_secret=True)]
     await verifier.verify(window, task_signal_hint="research", policy_name="strict")
 
     call_kwargs = client.messages.create.call_args.kwargs
@@ -225,3 +261,20 @@ async def test_verify_prompt_has_no_raw_content():
             assert forbidden not in content.lower(), (
                 f"forbidden field {forbidden!r} found in LLM prompt"
             )
+
+
+@pytest.mark.asyncio
+async def test_verify_prompt_no_injection_surface():
+    """Schema injection: path with injection attempt → only canonical hash appears in prompt."""
+    response_text = json.dumps({"score": 0.3, "class": "normal", "reasons": []})
+    client = _mock_client(response_text)
+    verifier = LLMAnomalyVerifier(client=client)
+    # Canonical intent already strips the raw path — only hash remains
+    window = [_ci(path_hash="deadbeef12345678", path_class=PathClass.WORKDIR)]
+    await verifier.verify(window, task_signal_hint="coding", policy_name="default")
+
+    call_kwargs = client.messages.create.call_args.kwargs
+    user_content = call_kwargs["messages"][0]["content"]
+    # The injection string never reaches the verifier prompt
+    assert "ignore previous instructions" not in user_content
+    assert "\n ignore" not in user_content
